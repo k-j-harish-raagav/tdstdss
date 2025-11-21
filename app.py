@@ -5,6 +5,22 @@ import json
 import base64
 import tempfile
 import sys
+try:
+    from langchain_core import pydantic_v1
+except ImportError:
+    import pydantic
+    # Create a fake 'langchain_core.pydantic_v1' module pointing to 'pydantic.v1'
+    # Pydantic v2 includes a '.v1' namespace for backward compatibility.
+    if hasattr(pydantic, "v1"):
+        sys.modules["langchain_core.pydantic_v1"] = pydantic.v1
+    else:
+        # Fallback for older Pydantic versions where the main module is v1
+        sys.modules["langchain_core.pydantic_v1"] = pydantic
+# ---------------------------------------------------------------------------
+
+# Now it is safe to import langchain modules
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,8 +54,6 @@ except Exception:
     PIL_AVAILABLE = False
 
 # LangChain / LLM imports (keep as you used)
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 
