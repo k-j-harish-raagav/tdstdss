@@ -86,7 +86,7 @@ class LLMWithFallback:
             for key in self.keys:
                 try:
                     # 1. Force set the env var (fixes many Pydantic validation issues)
-                    os.environ["google"] = key
+                    os.environ["GOOGLE_API_KEY"] = key
                     genai.configure(api_key=key)
 
                     # 2. Try standard initialization
