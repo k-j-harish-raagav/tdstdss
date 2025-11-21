@@ -56,94 +56,113 @@ except Exception:
 # LangChain / LLM imports (keep as you used)
 from langchain_core.tools import tool
 # ---------------------------------------------------------------------------
-# ⚠️ NUCLEAR FIX: Polyfills for missing LangChain components
-# This ensures the app runs regardless of version mismatches in the environment.
+# ⚠️ ULTIMATE COMPATIBILITY PATCH
+# This defines local fallbacks for ALL missing LangChain components
+# using only langchain_core to guarantee startup.
 # ---------------------------------------------------------------------------
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.agents import AgentFinish, AgentAction
+from langchain_core.messages import ToolMessage
 
-# 1. Secure the Agent Constructor (create_tool_calling_agent)
+# 1. Define Local Fallbacks (Safe from ImportErrors)
+class LocalToolParser:
+    """Simple parser that works without langchain.agents.output_parsers"""
+    def invoke(self, response):
+        # If the LLM response has tool_calls (standard in modern LangChain)
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            actions = []
+            for tool_call in response.tool_calls:
+                actions.append(AgentAction(
+                    tool=tool_call["name"],
+                    tool_input=tool_call["args"],
+                    log=f"Calling {tool_call['name']}..."
+                ))
+                # Monkey-patch ID for scratchpad compatibility
+                actions[-1].tool_call_id = tool_call["id"] 
+            return actions
+        # Otherwise, it's a final answer
+        return AgentFinish(return_values={"output": response.content}, log=str(response.content))
+
+def local_format_scratchpad(intermediate_steps):
+    """Simple formatter that works without langchain.agents.format_scratchpad"""
+    messages = []
+    for action, observation in intermediate_steps:
+        # Handle batch actions if necessary
+        if isinstance(action, list): 
+            action = action[0]
+        
+        # Try to get tool_call_id, fallback to "unknown" if missing
+        t_id = getattr(action, "tool_call_id", "unknown")
+        messages.append(ToolMessage(content=str(observation), tool_call_id=t_id))
+    return messages
+
+# 2. Robust 'create_tool_calling_agent'
 try:
     from langchain.agents import create_tool_calling_agent
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     try:
         from langchain.agents import create_openai_tools_agent as create_tool_calling_agent
-    except ImportError:
-        # Manual fallback if both missing
-        from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
-        from langchain_core.runnables import RunnablePassthrough
-        from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
-        
+    except (ImportError, ModuleNotFoundError):
+        # Fallback: Use our local helpers defined above
         def create_tool_calling_agent(llm, tools, prompt):
             return (
                 RunnablePassthrough.assign(
-                    agent_scratchpad=lambda x: format_to_openai_tool_messages(x["intermediate_steps"])
+                    agent_scratchpad=lambda x: local_format_scratchpad(x["intermediate_steps"])
                 )
                 | prompt
                 | llm.bind_tools(tools)
-                | OpenAIToolsAgentOutputParser()
+                | LocalToolParser()
             )
 
-# 2. Secure the Agent Runtime (AgentExecutor)
+# 3. Robust 'AgentExecutor'
 try:
-    # Try standard import first
     from langchain.agents import AgentExecutor
-except ImportError:
-    # Define a robust Polyfill class if the standard one is missing
-    from langchain_core.agents import AgentFinish, AgentAction
-    import traceback
-    
-    print("⚠️ Using Custom Polyfill for AgentExecutor", flush=True)
-
-    class AgentExecutor:
-        """Local implementation of AgentExecutor to bypass import errors."""
-        def __init__(self, agent, tools, verbose=False, handle_parsing_errors=True, **kwargs):
-            self.agent = agent
-            self.tools = {t.name: t for t in tools}
-            self.verbose = verbose
-            self.handle_parsing_errors = handle_parsing_errors
-
-        def invoke(self, inputs, config=None):
-            current_inputs = inputs.copy()
-            intermediate_steps = []
-            iterations = 0
-            max_iterations = 15
+except (ImportError, ModuleNotFoundError):
+    try:
+        from langchain.agents.agent import AgentExecutor
+    except (ImportError, ModuleNotFoundError):
+        # Fallback: Define a minimal Executor locally
+        class AgentExecutor:
+            def __init__(self, agent, tools, verbose=False, handle_parsing_errors=True, **kwargs):
+                self.agent = agent
+                self.tools = {t.name: t for t in tools}
             
-            while iterations < max_iterations:
-                current_inputs["intermediate_steps"] = intermediate_steps
-                try:
-                    # Run the agent to get next action
+            def invoke(self, inputs, config=None):
+                current_inputs = inputs.copy()
+                intermediate_steps = []
+                iterations = 0
+                
+                while iterations < 15: # Max iterations
+                    current_inputs["intermediate_steps"] = intermediate_steps
+                    
+                    # Run the agent
                     output = self.agent.invoke(current_inputs)
-                except Exception as e:
-                    if self.handle_parsing_errors:
-                        return {"output": f"Agent Error: {str(e)}"}
-                    raise e
-
-                # Check for completion
-                if isinstance(output, AgentFinish):
-                    return output.return_values
-                
-                # Handle Actions (support both single action and list of actions)
-                actions = output if isinstance(output, list) else [output]
-                
-                steps = []
-                for action in actions:
-                    if isinstance(action, AgentFinish):
-                        return action.return_values
                     
-                    # Execute tool
-                    if action.tool in self.tools:
-                        try:
-                            tool_result = self.tools[action.tool].invoke(action.tool_input)
-                        except Exception as e:
-                            tool_result = f"Error executing tool {action.tool}: {str(e)}"
-                    else:
-                        tool_result = f"Error: Tool '{action.tool}' not found."
+                    # Check for finish
+                    if isinstance(output, AgentFinish):
+                        return output.return_values
                     
-                    steps.append((action, str(tool_result)))
-                
-                intermediate_steps.extend(steps)
-                iterations += 1
-                
-            return {"output": "Agent stopped: Max iterations reached."}
+                    # Execute Actions
+                    actions = output if isinstance(output, list) else [output]
+                    steps_batch = []
+                    
+                    for action in actions:
+                        if isinstance(action, AgentFinish):
+                            return action.return_values
+                        
+                        if action.tool in self.tools:
+                            try:
+                                obs = self.tools[action.tool].invoke(action.tool_input)
+                            except Exception as e:
+                                obs = f"Error: {str(e)}"
+                        else:
+                            obs = f"Tool {action.tool} not found"
+                        
+                        steps_batch.append((action, str(obs)))
+                    
+                    intermediate_steps.extend(steps_batch)
+                    iterations += 1
+                return {"output": "Agent stopped: Max iterations reached."}
 # ---------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
