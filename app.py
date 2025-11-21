@@ -56,24 +56,35 @@ except Exception:
 # LangChain / LLM imports (keep as you used)
 from langchain_core.tools import tool
 # ---------------------------------------------------------------------------
-# ⚠️ IMPORT FIX: Handle missing create_tool_calling_agent
+# ⚠️ ROBUST AGENT IMPORTS: Handle all version mismatches
 # ---------------------------------------------------------------------------
-from langchain.agents import AgentExecutor
-
+# 1. Locate AgentExecutor
 try:
-    # Try standard import
+    # Standard import
+    from langchain.agents import AgentExecutor
+except ImportError:
+    try:
+        # Internal path fallback (often works when top-level fails)
+        from langchain.agents.agent import AgentExecutor
+    except ImportError:
+        raise ImportError("Critical: Could not find 'AgentExecutor' in langchain.agents or langchain.agents.agent")
+
+# 2. Locate create_tool_calling_agent
+try:
+    # Standard modern import
     from langchain.agents import create_tool_calling_agent
 except ImportError:
     try:
-        # Fallback for older langchain versions (functionally equivalent)
+        # Fallback to OpenAI tools agent (functionally equivalent for binding tools)
         from langchain.agents import create_openai_tools_agent as create_tool_calling_agent
     except ImportError:
-        # Final fallback: manually define the agent constructor if all else fails
-        from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
+        # 3. Deep Fallback: Manually reconstruct the agent function if the factory is missing
         from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
         from langchain_core.runnables import RunnablePassthrough
-
+        from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
+        
         def create_tool_calling_agent(llm, tools, prompt):
+            """Polyfill for missing create_tool_calling_agent"""
             return (
                 RunnablePassthrough.assign(
                     agent_scratchpad=lambda x: format_to_openai_tool_messages(x["intermediate_steps"])
