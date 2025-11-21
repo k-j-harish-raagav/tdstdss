@@ -65,24 +65,94 @@ from langchain_core.agents import AgentFinish, AgentAction
 from langchain_core.messages import ToolMessage
 
 # 1. Define Local Fallbacks (Safe from ImportErrors)
-class LocalToolParser:
-    """Simple parser that works without langchain.agents.output_parsers"""
-    def invoke(self, response):
-        # If the LLM response has tool_calls (standard in modern LangChain)
-        if hasattr(response, "tool_calls") and response.tool_calls:
-            actions = []
-            for tool_call in response.tool_calls:
-                actions.append(AgentAction(
-                    tool=tool_call["name"],
-                    tool_input=tool_call["args"],
-                    log=f"Calling {tool_call['name']}..."
-                ))
-                # Monkey-patch ID for scratchpad compatibility
-                actions[-1].tool_call_id = tool_call["id"] 
-            return actions
-        # Otherwise, it's a final answer
-        return AgentFinish(return_values={"output": response.content}, log=str(response.content))
+# ---------------------------------------------------------------------------
+# ⚠️ ROBUST LLM WRAPPER: Handles Pydantic V2 Validation Errors
+# ---------------------------------------------------------------------------
+class LLMWithFallback:
+    def __init__(self, keys=None, models=None, temperature=0):
+        self.keys = keys or GEMINI_KEYS
+        self.models = models or MODEL_HIERARCHY
+        self.temperature = temperature
+        self.slow_keys_log = defaultdict(list)
+        self.failing_keys_log = defaultdict(int)
+        self.current_llm = None
 
+    def _get_llm_instance(self):
+        last_error = None
+        import os
+        import google.generativeai as genai
+
+        for model in self.models:
+            for key in self.keys:
+                try:
+                    # 1. Force set the env var (fixes many Pydantic validation issues)
+                    os.environ["google"] = key
+                    genai.configure(api_key=key)
+
+                    # 2. Try standard initialization
+                    try:
+                        llm_instance = ChatGoogleGenerativeAI(
+                            model=model,
+                            temperature=self.temperature,
+                            google_api_key=key,
+                            convert_system_message_to_human=True
+                        )
+                    except Exception as pydantic_err:
+                        # 3. Fallback: Use model_construct to bypass validation
+                        # This creates the object without running the strict validators
+                        print(f"⚠️ Validation error for {model}: {pydantic_err}. Using model_construct bypass.", flush=True)
+                        llm_instance = ChatGoogleGenerativeAI.model_construct(
+                            model=model,
+                            temperature=self.temperature,
+                            google_api_key=key,
+                            client=None, # Let the library handle client lazily
+                            convert_system_message_to_human=True
+                        )
+                    
+                    self.current_llm = llm_instance
+                    return llm_instance
+
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    if any(qk in msg for qk in QUOTA_KEYWORDS):
+                        self.slow_keys_log[key].append(model)
+                    self.failing_keys_log[key] += 1
+                    time.sleep(0.2)
+        
+        print(f"❌ All LLM inits failed. Last error: {last_error}", flush=True)
+        
+        # 4. Emergency Mock to prevent App Crash at Startup
+        # If we can't create a real LLM, return a dummy one so uvicorn starts.
+        # The error will only appear if the user actually tries to run a query.
+        from langchain_core.language_models.chat_models import BaseChatModel
+        from langchain_core.messages import AIMessage
+        
+        class MockLLM(BaseChatModel):
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                return type('Result', (), {'generations': [type('Gen', (), {'message': AIMessage(content="System Error: Could not initialize Gemini API.")})()]})()
+            
+            @property
+            def _llm_type(self): return "mock"
+            
+            def bind_tools(self, tools, **kwargs):
+                return self # Return self to satisfy the agent pipeline
+                
+        return MockLLM()
+
+    def bind_tools(self, tools):
+        try:
+            llm_instance = self._get_llm_instance()
+            return llm_instance.bind_tools(tools)
+        except Exception as e:
+            print(f"⚠️ Error binding tools: {e}", flush=True)
+            # Return a dummy runnable that doesn't crash
+            from langchain_core.runnables import RunnableLambda
+            return RunnableLambda(lambda x: x)
+
+    def invoke(self, prompt):
+        llm_instance = self._get_llm_instance()
+        return llm_instance.invoke(prompt)
 def local_format_scratchpad(intermediate_steps):
     """Simple formatter that works without langchain.agents.format_scratchpad"""
     messages = []
