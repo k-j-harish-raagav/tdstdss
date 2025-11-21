@@ -56,35 +56,23 @@ except Exception:
 # LangChain / LLM imports (keep as you used)
 from langchain_core.tools import tool
 # ---------------------------------------------------------------------------
-# ⚠️ ROBUST AGENT IMPORTS: Handle all version mismatches
+# ⚠️ NUCLEAR FIX: Polyfills for missing LangChain components
+# This ensures the app runs regardless of version mismatches in the environment.
 # ---------------------------------------------------------------------------
-# 1. Locate AgentExecutor
-try:
-    # Standard import
-    from langchain.agents import AgentExecutor
-except ImportError:
-    try:
-        # Internal path fallback (often works when top-level fails)
-        from langchain.agents.agent import AgentExecutor
-    except ImportError:
-        raise ImportError("Critical: Could not find 'AgentExecutor' in langchain.agents or langchain.agents.agent")
 
-# 2. Locate create_tool_calling_agent
+# 1. Secure the Agent Constructor (create_tool_calling_agent)
 try:
-    # Standard modern import
     from langchain.agents import create_tool_calling_agent
 except ImportError:
     try:
-        # Fallback to OpenAI tools agent (functionally equivalent for binding tools)
         from langchain.agents import create_openai_tools_agent as create_tool_calling_agent
     except ImportError:
-        # 3. Deep Fallback: Manually reconstruct the agent function if the factory is missing
+        # Manual fallback if both missing
         from langchain.agents.output_parsers.openai_tools import OpenAIToolsAgentOutputParser
         from langchain_core.runnables import RunnablePassthrough
         from langchain.agents.format_scratchpad.openai_tools import format_to_openai_tool_messages
         
         def create_tool_calling_agent(llm, tools, prompt):
-            """Polyfill for missing create_tool_calling_agent"""
             return (
                 RunnablePassthrough.assign(
                     agent_scratchpad=lambda x: format_to_openai_tool_messages(x["intermediate_steps"])
@@ -93,6 +81,69 @@ except ImportError:
                 | llm.bind_tools(tools)
                 | OpenAIToolsAgentOutputParser()
             )
+
+# 2. Secure the Agent Runtime (AgentExecutor)
+try:
+    # Try standard import first
+    from langchain.agents import AgentExecutor
+except ImportError:
+    # Define a robust Polyfill class if the standard one is missing
+    from langchain_core.agents import AgentFinish, AgentAction
+    import traceback
+    
+    print("⚠️ Using Custom Polyfill for AgentExecutor", flush=True)
+
+    class AgentExecutor:
+        """Local implementation of AgentExecutor to bypass import errors."""
+        def __init__(self, agent, tools, verbose=False, handle_parsing_errors=True, **kwargs):
+            self.agent = agent
+            self.tools = {t.name: t for t in tools}
+            self.verbose = verbose
+            self.handle_parsing_errors = handle_parsing_errors
+
+        def invoke(self, inputs, config=None):
+            current_inputs = inputs.copy()
+            intermediate_steps = []
+            iterations = 0
+            max_iterations = 15
+            
+            while iterations < max_iterations:
+                current_inputs["intermediate_steps"] = intermediate_steps
+                try:
+                    # Run the agent to get next action
+                    output = self.agent.invoke(current_inputs)
+                except Exception as e:
+                    if self.handle_parsing_errors:
+                        return {"output": f"Agent Error: {str(e)}"}
+                    raise e
+
+                # Check for completion
+                if isinstance(output, AgentFinish):
+                    return output.return_values
+                
+                # Handle Actions (support both single action and list of actions)
+                actions = output if isinstance(output, list) else [output]
+                
+                steps = []
+                for action in actions:
+                    if isinstance(action, AgentFinish):
+                        return action.return_values
+                    
+                    # Execute tool
+                    if action.tool in self.tools:
+                        try:
+                            tool_result = self.tools[action.tool].invoke(action.tool_input)
+                        except Exception as e:
+                            tool_result = f"Error executing tool {action.tool}: {str(e)}"
+                    else:
+                        tool_result = f"Error: Tool '{action.tool}' not found."
+                    
+                    steps.append((action, str(tool_result)))
+                
+                intermediate_steps.extend(steps)
+                iterations += 1
+                
+            return {"output": "Agent stopped: Max iterations reached."}
 # ---------------------------------------------------------------------------
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
